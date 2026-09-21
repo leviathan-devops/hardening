@@ -11,3 +11,4 @@ backups/
 ledger.sqlite
 state/
 *.log
+*.bak*
