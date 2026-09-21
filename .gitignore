@@ -1,0 +1,13 @@
+# never commit credentials or runtime state
+*.admin-key
+.admin-key
+*creds*.json
+.shadow-creds.json
+*.token
+*.key
+__pycache__/
+*.pyc
+backups/
+ledger.sqlite
+state/
+*.log

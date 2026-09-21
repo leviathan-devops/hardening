@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# harden.sh — production runtime hardening toolchain for systemd user units.
+#
+# FROZEN INTERFACE:
+#   harden.sh apply  --unit <name> --profile <strict|service> [--allow-write <path>]... \
+#                    [--inaccessible <path>]... --smoke "<cmd>" --context-file <path> \
+#                    [--dry-run]
+#   harden.sh show   --unit <name>
+#   harden.sh unlock --unit <name>
+#   harden.sh lock   --unit <name>
+#   harden.sh list
+#
+# WRITE ONLY under the hardening/ directory.
+# FAIL-CLOSED: if the smoke test fails after applying, the backup drop-in is
+# restored, daemon-reload is re-run, and the failure is reported — the service
+# is never left broken.
+set -euo pipefail
+
+HARDENING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROFILES_DIR="${HARDENING_DIR}/profiles"
+BACKUPS_DIR="${HARDENING_DIR}/backups"
+LEDGER_PY="${HARDENING_DIR}/ledger.py"
+DROPIN_BASE="${HOME}/.config/systemd/user"
+
+mkdir -p "${BACKUPS_DIR}"
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+hostname() { python3 -c 'import socket;print(socket.gethostname())'; }
+
+# Run a command; returns empty on failure (best-effort).
+probe() {
+  "$@" 2>/dev/null || true
+}
+
+# systemctl --user show <unit>  →  emit resolved props as JSON
+props_json() {
+  local unit="$1"
+  systemctl --user show "$unit" 2>/dev/null \
+    | python3 -c '
+import sys, json
+out = {}
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    k, _, v = line.partition("=")
+    out[k] = v
+print(json.dumps(out, indent=2, sort_keys=True))
+'
+}
+
+# Capture the systemd-analyze security score summary line
+security_score() {
+  local unit="$1"
+  systemd-analyze security --user "$unit" 2>/dev/null \
+    | grep -E 'Overall exposure level' || true
+}
+
+# Build the drop-in content for a given profile + flags.
+build_dropin() {
+  local profile_name="$1"
+  local profile_file="${PROFILES_DIR}/${profile_name}.conf"
+  if [[ ! -f "$profile_file" ]]; then
+    echo "FATAL: profile '${profile_name}' not found at ${profile_file}" >&2
+    exit 2
+  fi
+
+  # Read the profile, filtering out comments/blank lines
+  local body
+  body="$(grep -v '^[[:space:]]*#' "$profile_file" | grep -v '^[[:space:]]*$' || true)"
+
+  local inaccessible=""
+  local readwrite=""
+
+  # --inaccessible paths → InaccessiblePaths= (best-effort, `-` prefix
+  # matches the precedent unit's house style: the unit still starts even
+  # if a path is absent)
+  if [[ "${#INACCESSIBLE_PATHS[@]}" -gt 0 ]]; then
+    for p in "${INACCESSIBLE_PATHS[@]}"; do
+      inaccessible+="${inaccessible:+$'\n'}InaccessiblePaths=-${p}"
+    done
+  fi
+
+  # --allow-write paths → ReadWritePaths= (REQUIRED under ProtectSystem=strict)
+  # Plus sensible defaults: WorkingDirectory + /run (systemd runtime data)
+  local wd
+  wd="$(probe systemctl --user show -p WorkingDirectory "$UNIT" 2>/dev/null || true)"
+  wd="${wd#WorkingDirectory=}"
+  wd="${wd:-${HOME}}"
+
+  readwrite="${wd}"
+  readwrite+=$'\n/run'
+  for p in "${ALLOW_WRITE_PATHS[@]:-}"; do
+    [[ -n "$p" ]] && readwrite+=$'\n'"${p}"
+  done
+
+  local result="$body"
+  if [[ -n "$inaccessible" ]]; then
+    result+=$'\n'"${inaccessible}"
+  fi
+  if [[ -n "$readwrite" ]]; then
+    result+=$'\n# ReadWritePaths (defaults under ProtectSystem=strict)'
+    while IFS= read -r r; do
+      [[ -n "$r" ]] && result+=$'\n'"ReadWritePaths=${r}"
+    done <<< "$readwrite"
+  fi
+
+  printf '%s\n' "$result"
+}
+
+# ── argument parsing ───────────────────────────────────────────────────────
+
+ACTION="${1:-}"
+shift || true
+
+UNIT=""
+PROFILE=""
+SMOKE_CMD=""
+CONTEXT_FILE=""
+DRY_RUN=0
+INACCESSIBLE_PATHS=()
+ALLOW_WRITE_PATHS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    apply|show|unlock|lock|list)
+      # already captured ACTION
+      ;;
+    --unit)
+      UNIT="$2"; shift 2 ;;
+    --profile)
+      PROFILE="$2"; shift 2 ;;
+    --smoke)
+      SMOKE_CMD="$2"; shift 2 ;;
+    --context-file)
+      CONTEXT_FILE="$2"; shift 2 ;;
+    --dry-run)
+      DRY_RUN=1; shift ;;
+    --allow-write)
+      ALLOW_WRITE_PATHS+=("$2"); shift 2 ;;
+    --inaccessible)
+      INACCESSIBLE_PATHS+=("$2"); shift 2 ;;
+    -h|--help)
+      head -30 "$0" | tail -28
+      exit 0 ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 2 ;;
+  esac
+done
+
+# ── commands ───────────────────────────────────────────────────────────────
+
+case "$ACTION" in
+
+# ════════════════════════════════════════════════════════════════════════════
+# APPLY
+# ════════════════════════════════════════════════════════════════════════════
+apply)
+  [[ -z "$UNIT" ]]     && { echo "FATAL: --unit required" >&2; exit 2; }
+  [[ -z "$PROFILE" ]]  && { echo "FATAL: --profile required" >&2; exit 2; }
+  [[ -z "$SMOKE_CMD" ]] && { echo "FATAL: --smoke required" >&2; exit 2; }
+
+  PROFILE_FILE="${PROFILES_DIR}/${PROFILE}.conf"
+  [[ ! -f "$PROFILE_FILE" ]] && { echo "FATAL: profile '${PROFILE}' not found" >&2; exit 2; }
+
+  # Resolve unit file path
+  UNIT_FILE="$(probe systemctl --user show -p FragmentPath "$UNIT")"
+  UNIT_FILE="${UNIT_FILE#FragmentPath=}"
+  [[ -z "$UNIT_FILE" ]] && UNIT_FILE=""
+
+  # Capture BEFORE state
+  BEFORE_JSON="$(props_json "$UNIT")"
+  SCORE_BEFORE="$(security_score "$UNIT")"
+
+  # Build directives object (what we are applying)
+  DIRECTIVES_JSON="$(python3 -c "
+import json
+profile_body = open('${PROFILE_FILE}').read()
+print(json.dumps({'profile': '${PROFILE}', 'profile_file': '${PROFILE_FILE}', 'profile_body': profile_body}))
+")"
+
+  # Build the drop-in content
+  DROPIN_CONTENT="$(build_dropin "$PROFILE")"
+
+  # Determine the drop-in file path
+  DROPIN_DIR="${DROPIN_BASE}/${UNIT}.d"
+  DROPIN_FILE="${DROPIN_DIR}/90-hardening.conf"
+
+  # Backup any existing drop-in
+  BACKUP_PATH=""
+  if [[ -f "$DROPIN_FILE" ]]; then
+    BACKUP_PATH="${BACKUPS_DIR}/${UNIT}-$(date +%Y%m%d-%H%M%S).conf"
+    cp "$DROPIN_FILE" "$BACKUP_PATH"
+  fi
+
+  # Read context file
+  CONTEXT_MD=""
+  if [[ -n "$CONTEXT_FILE" && -f "$CONTEXT_FILE" ]]; then
+    CONTEXT_MD="$(cat "$CONTEXT_FILE")"
+  fi
+
+  ROLLBACK_CMD="bash ${HARDENING_DIR}/rollback.sh --unit ${UNIT}"
+  UNLOCK_CMD="bash ${HARDENING_DIR}/harden.sh unlock --unit ${UNIT}"
+  LOCK_CMD="bash ${HARDENING_DIR}/harden.sh lock --unit ${UNIT}"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "=== DRY RUN — no changes written, no ledger record ==="
+    echo "--- drop-in that WOULD be written: ${DROPIN_FILE} ---"
+    echo ""
+    echo "  [Service]"
+    echo "$DROPIN_CONTENT"
+    echo ""
+    echo "--- BEFORE score: ${SCORE_BEFORE:-<no score>} ---"
+    echo "--- smoke command: ${SMOKE_CMD} ---"
+    echo "--- rollback command: ${ROLLBACK_CMD} ---"
+    if [[ -n "$BACKUP_PATH" ]]; then
+      echo "--- would back up existing drop-in to: ${BACKUP_PATH} ---"
+    fi
+    echo "=== DRY RUN complete — ledger NOT modified ==="
+    exit 0
+  fi
+
+  # ── REAL APPLY ───────────────────────────────────────────────────────────
+
+  # Write the drop-in
+  mkdir -p "$DROPIN_DIR"
+  printf '%s\n' "$DROPIN_CONTENT" > "$DROPIN_FILE"
+
+  # daemon-reload
+  systemctl --user daemon-reload
+
+  # Capture AFTER state
+  AFTER_JSON="$(props_json "$UNIT")"
+  SCORE_AFTER="$(security_score "$UNIT")"
+
+  # Run the smoke test
+  SMOKE_OUTPUT=""
+  SMOKE_EXIT=0
+  set +e
+  SMOKE_OUTPUT="$(eval "$SMOKE_CMD" 2>&1)"
+  SMOKE_EXIT=$?
+  set -e
+
+  if [[ $SMOKE_EXIT -ne 0 ]]; then
+    SMOKE_RESULT="FAILED (exit ${SMOKE_EXIT})
+${SMOKE_OUTPUT}"
+    # FAIL-CLOSED: restore backup, daemon-reload, report
+    if [[ -n "$BACKUP_PATH" && -f "$BACKUP_PATH" ]]; then
+      cp "$BACKUP_PATH" "$DROPIN_FILE"
+    else
+      rm -f "$DROPIN_FILE"
+    fi
+    systemctl --user daemon-reload
+    SCORE_AFTER_FAIL="$(security_score "$UNIT")"
+
+    echo "========================================"
+    echo "HARDENING FAILED — FAIL CLOSED"
+    echo "========================================"
+    echo "unit          : ${UNIT}"
+    echo "profile       : ${PROFILE}"
+    echo "before score  : ${SCORE_BEFORE:-<none>}"
+    echo "after score   : ${SCORE_AFTER_FAIL:-<none>}"
+    echo "smoke result  : ${SMOKE_RESULT}"
+    echo "rollback cmd  : ${ROLLBACK_CMD}"
+    echo "========================================"
+    exit 1
+  fi
+
+  SMOKE_RESULT="OK (exit ${SMOKE_EXIT})
+${SMOKE_OUTPUT}"
+
+  # Record in ledger via a temp JSON file (avoids all shell-escaping)
+  local _tmp_json
+  _tmp_json="$(mktemp /tmp/harden_ledger_XXXXXX.json)"
+  python3 -c "
+import json, sys
+data = {
+    'target': sys.argv[1],
+    'unit_file': sys.argv[2] if sys.argv[2] else None,
+    'dropin_file': sys.argv[3],
+    'profile': sys.argv[4],
+    'before_json': json.loads(sys.argv[5]) if sys.argv[5].strip() else None,
+    'after_json': json.loads(sys.argv[6]) if sys.argv[6].strip() else None,
+    'directives_json': json.loads(sys.argv[7]) if sys.argv[7].strip() else None,
+    'backup_path': sys.argv[8] if sys.argv[8] else None,
+    'rollback_cmd': sys.argv[9],
+    'unlock_cmd': sys.argv[10],
+    'lock_cmd': sys.argv[11],
+    'smoke_cmd': sys.argv[12],
+    'smoke_result': sys.argv[13],
+    'security_score_before': sys.argv[14],
+    'security_score_after': sys.argv[15],
+    'context_md': sys.argv[16],
+}
+with open(sys.argv[17], 'w') as f:
+    json.dump(data, f)
+" "$UNIT" "$UNIT_FILE" "$DROPIN_FILE" "$PROFILE" \
+    "$BEFORE_JSON" "$AFTER_JSON" "$DIRECTIVES_JSON" \
+    "$BACKUP_PATH" "$ROLLBACK_CMD" "$UNLOCK_CMD" "$LOCK_CMD" \
+    "$SMOKE_CMD" "$SMOKE_RESULT" "$SCORE_BEFORE" "$SCORE_AFTER" \
+    "$CONTEXT_MD" "$_tmp_json"
+
+  python3 -c "
+import json, sys
+sys.path.insert(0, '$HARDENING_DIR')
+import ledger as L
+d = json.load(open('$(_tmp_json)'))
+L.record(**d)
+" 2>/dev/null || true
+  rm -f "$_tmp_json"
+
+  # Final report
+  echo "========================================"
+  echo "HARDENING APPLIED"
+  echo "========================================"
+  echo "unit          : ${UNIT}"
+  echo "profile       : ${PROFILE}"
+  echo "drop-in       : ${DROPIN_FILE}"
+  echo "before score  : ${SCORE_BEFORE:-<none>}"
+  echo "after score   : ${SCORE_AFTER:-<none>}"
+  echo "smoke result  : ${SMOKE_RESULT}"
+  echo "rollback cmd  : ${ROLLBACK_CMD}"
+  echo "unlock cmd    : ${UNLOCK_CMD}"
+  echo "========================================"
+  ;;
+
+# ════════════════════════════════════════════════════════════════════════════
+# SHOW
+# ════════════════════════════════════════════════════════════════════════════
+show)
+  [[ -z "$UNIT" ]] && { echo "FATAL: --unit required" >&2; exit 2; }
+  DROPIN_FILE="${DROPIN_BASE}/${UNIT}.d/90-hardening.conf"
+  if [[ -f "$DROPIN_FILE" ]]; then
+    echo "--- drop-in: ${DROPIN_FILE} ---"
+    cat "$DROPIN_FILE"
+  else
+    echo "[no hardening drop-in found for ${UNIT} at ${DROPIN_FILE}]"
+  fi
+  echo "--- ledger entry ---"
+  python3 "$LEDGER_PY" show "$UNIT" 2>/dev/null || echo "[no ledger record for ${UNIT}]"
+  ;;
+
+# ════════════════════════════════════════════════════════════════════════════
+# UNLOCK
+# ════════════════════════════════════════════════════════════════════════════
+unlock)
+  [[ -z "$UNIT" ]] && { echo "FATAL: --unit required" >&2; exit 2; }
+  DROPIN_DIR="${DROPIN_BASE}/${UNIT}.d"
+  UNLOCK_FILE="${DROPIN_DIR}/99-unlocked.conf"
+  mkdir -p "$DROPIN_DIR"
+  # Override every sandbox directive to relaxed/off values.
+  cat > "$UNLOCK_FILE" <<'EOF'
+# Temporary unlock — written by harden.sh unlock
+# Overrides ALL hardening sandbox directives to relaxed/off values.
+NoNewPrivileges=no
+PrivateTmp=no
+ProtectSystem=off
+ProtectHome=off
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ProtectControlGroups=no
+ProtectClock=no
+ProtectHostname=no
+RestrictSUIDSGID=no
+RestrictNamespaces=no
+RestrictRealtime=no
+LockPersonality=no
+MemoryDenyWriteExecute=no
+RestrictAddressFamilies=
+SystemCallArchitectures=
+InaccessiblePaths=
+ReadWritePaths=
+EOF
+  systemctl --user daemon-reload
+  python3 "$LEDGER_PY" event "$UNIT" "unlock" "temporary sandbox relaxation via ${UNLOCK_FILE}" "$(hostname)"
+  echo "UNLOCKED: ${UNLOCK_FILE} written, daemon-reload done."
+  echo "Re-lock with: bash ${HARDENING_DIR}/harden.sh lock --unit ${UNIT}"
+  ;;
+
+# ════════════════════════════════════════════════════════════════════════════
+# LOCK
+# ════════════════════════════════════════════════════════════════════════════
+lock)
+  [[ -z "$UNIT" ]] && { echo "FATAL: --unit required" >&2; exit 2; }
+  UNLOCK_FILE="${DROPIN_BASE}/${UNIT}.d/99-unlocked.conf"
+  if [[ -f "$UNLOCK_FILE" ]]; then
+    rm -f "$UNLOCK_FILE"
+    systemctl --user daemon-reload
+    python3 "$LEDGER_PY" event "$UNIT" "lock" "unlock marker removed, hardening re-applied" "$(hostname)"
+    echo "LOCKED: ${UNLOCK_FILE} removed, daemon-reload done."
+  else
+    echo "[no unlock marker found at ${UNLOCK_FILE}]"
+  fi
+  ;;
+
+# ════════════════════════════════════════════════════════════════════════════
+# LIST
+# ════════════════════════════════════════════════════════════════════════════
+list)
+  python3 "$LEDGER_PY" list
+  ;;
+
+# ════════════════════════════════════════════════════════════════════════════
+*)
+  echo "usage: harden.sh apply  --unit <name> --profile <strict|service> ..." >&2
+  echo "              show   --unit <name>" >&2
+  echo "              unlock --unit <name>" >&2
+  echo "              lock   --unit <name>" >&2
+  echo "              list" >&2
+  exit 2
+  ;;
+esac
