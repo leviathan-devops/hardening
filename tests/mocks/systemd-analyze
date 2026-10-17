@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Test double for `systemd-analyze security --user <unit>`.
+set -euo pipefail
+unit="${*: -1}"
+printf 'Overall exposure level for %s: 2.0 EXPOSED\n' "$unit"
