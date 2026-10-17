@@ -1,0 +1,47 @@
+Watched-red-first. This file records the suite run against the unfixed scripts,
+before the fixes on this branch. Every new test failed. Nothing was applied
+to a real host: HOME was a temp directory, systemctl was either mocked or
+absent, /home/ubuntu/.config/systemd was not created, and the repo did not
+gain backups/ or ledger.sqlite.
+
+shellcheck rollback.sh
+  FAIL  SC2034  DROPIN_BASE unused at rollback.sh:14
+  harden.sh was already clean
+
+pytest tests/test_ledger.py tests/test_redact.py
+  6 failed, 0 passed
+  test_event_cli_records_a_row
+    SystemExit 2. ledger.py rejected `event` (usage listed only list|show|context).
+  test_record_json_then_get_json_keeps_quoted_target
+    SystemExit 2. `record-json` was not a command.
+  test_get_json_missing_target_exits_1
+    exit 2, expected 1. `get-json` was not a command.
+  test_two_records_in_the_same_second_get_distinct_ids
+    sqlite3.IntegrityError: UNIQUE constraint failed: hardened.id
+  test_redact_drops_secret_fields
+    scripts/redact_gitleaks.py did not exist.
+  test_redact_empty_scan_is_clean
+    scripts/redact_gitleaks.py did not exist.
+
+bats tests/safety.bats
+  21 failed, 0 passed
+  list, show, and apply-without---unit created backups/ on invocation.
+  apply with no --execute wrote the drop-in (stdout had no DRY RUN banner).
+  explicit --dry-run still copied the existing drop-in into backups/.
+  dry-run with systemctl absent exited 127.
+  --dry-run combined with --execute did not report that the flags cannot be combined
+    (--execute was an unknown option).
+  apply, unlock, lock, and rollback rejected --execute as an unknown option (exit 2).
+  unlock, lock, and rollback with no extra flag exited 2 after changing the host,
+    because they call `ledger.py event` and that command did not exist.
+  rollback --unit o'brien did not report "no ledger record" (the inline Python
+    query failed).
+
+Separate sandbox check of the same unfixed scripts, also under a temp HOME
+with a mock systemctl, before these tests existed:
+  --dry-run printed two [Service] headers and had already copied the drop-in
+    into backups/ while saying nothing was written.
+  apply with no dry-run flag wrote the drop-in and called daemon-reload.
+  a failing daemon-reload left the new drop-in on disk (not fail-closed).
+  unlock wrote 99-unlocked.conf, then exited 2 on the missing event command.
+  rollback of a unit name containing a quote returned "ledger query failed".
