@@ -4,6 +4,9 @@
 Schema is frozen (see CONTEXT block in the operator brief).  This module owns
 ledger.sqlite at the project root, the single source of truth for every
 hardening action taken on this host.
+
+CLI: list | show <target> | context <target> | event <target> <action> [detail] [actor]
+     | record-json <file> | get-json <target>
 """
 from __future__ import annotations
 
@@ -74,6 +77,17 @@ def init_schema(wipe: bool = False) -> None:
         conn.close()
 
 
+def _slug(conn: sqlite3.Connection, target: str, when: datetime) -> str:
+    """`<target>-YYYYMMDD-HHMMSS`, with `-N` appended if that id is taken."""
+    base = f"{target}-{when.strftime('%Y%m%d-%H%M%S')}"
+    slug = base
+    suffix = 0
+    while conn.execute("SELECT 1 FROM hardened WHERE id = ?", (slug,)).fetchone():
+        suffix += 1
+        slug = f"{base}-{suffix}"
+    return slug
+
+
 def record(
     *,
     target: str,
@@ -97,10 +111,11 @@ def record(
 ) -> str:
     """Insert a hardening record and log an event. Returns the row id."""
     init_schema()
-    now = datetime.now(timezone.utc).isoformat()
-    slug = f"{target}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
     conn = _connect()
     try:
+        slug = _slug(conn, target, now_dt)
         conn.execute(
             """
             INSERT INTO hardened (
@@ -142,6 +157,46 @@ def record(
         return slug
     finally:
         conn.close()
+
+
+def _blank_to_none(value):
+    if value is None or value == "":
+        return None
+    return value
+
+
+def _load_json_field(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        return json.loads(text)
+    return value
+
+
+def record_from_mapping(data: dict) -> str:
+    """Insert a record from the JSON object `harden.sh` writes."""
+    return record(
+        target=data["target"],
+        unit_file=_blank_to_none(data.get("unit_file")),
+        dropin_file=_blank_to_none(data.get("dropin_file")),
+        profile=data["profile"],
+        before_json=_load_json_field(data.get("before_json")),
+        after_json=_load_json_field(data.get("after_json")),
+        directives_json=_load_json_field(data.get("directives_json")),
+        backup_path=_blank_to_none(data.get("backup_path")),
+        rollback_cmd=_blank_to_none(data.get("rollback_cmd")),
+        unlock_cmd=_blank_to_none(data.get("unlock_cmd")),
+        lock_cmd=_blank_to_none(data.get("lock_cmd")),
+        smoke_cmd=_blank_to_none(data.get("smoke_cmd")),
+        smoke_result=_blank_to_none(data.get("smoke_result")),
+        security_score_before=_blank_to_none(data.get("security_score_before")),
+        security_score_after=_blank_to_none(data.get("security_score_after")),
+        context_md=_blank_to_none(data.get("context_md")),
+        actor=_blank_to_none(data.get("actor")),
+    )
 
 
 def get(target: str) -> sqlite3.Row | None:
@@ -255,24 +310,65 @@ def _cli_context(target: str) -> None:
     print(textwrap.dedent(md))
 
 
-def main() -> None:
-    init_schema()
-    args = sys.argv[1:]
-    if not args or args[0] not in ("list", "show", "context"):
-        print("usage: ledger.py list | show <target> | context <target>", file=sys.stderr)
+def _cli_event(args: list[str]) -> None:
+    if len(args) < 3:
+        print("usage: ledger.py event <target> <action> [detail] [actor]", file=sys.stderr)
         sys.exit(2)
-    if args[0] == "list":
+    detail = args[3] if len(args) > 3 else None
+    actor = args[4] if len(args) > 4 else None
+    event(args[1], args[2], detail, actor)
+
+
+def _cli_record_json(path: str) -> None:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    print(record_from_mapping(payload))
+
+
+def _cli_get_json(target: str) -> None:
+    row = get(target)
+    if row is None:
+        print(f"FATAL: no ledger record for {target}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({
+        "backup_path": row["backup_path"] or "",
+        "dropin_file": row["dropin_file"] or "",
+    }))
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    command = args[0] if args else ""
+    if command == "list":
         _cli_list()
-    elif args[0] == "show":
+    elif command == "show":
         if len(args) < 2:
             print("usage: ledger.py show <target>", file=sys.stderr)
             sys.exit(2)
         _cli_show(args[1])
-    elif args[0] == "context":
+    elif command == "context":
         if len(args) < 2:
             print("usage: ledger.py context <target>", file=sys.stderr)
             sys.exit(2)
         _cli_context(args[1])
+    elif command == "event":
+        _cli_event(args)
+    elif command == "record-json":
+        if len(args) != 2:
+            print("usage: ledger.py record-json <file>", file=sys.stderr)
+            sys.exit(2)
+        _cli_record_json(args[1])
+    elif command == "get-json":
+        if len(args) != 2:
+            print("usage: ledger.py get-json <target>", file=sys.stderr)
+            sys.exit(2)
+        _cli_get_json(args[1])
+    else:
+        print(
+            "usage: ledger.py list | show <target> | context <target> | "
+            "event <target> <action> [detail] [actor] | record-json <file> | get-json <target>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 
 if __name__ == "__main__":

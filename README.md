@@ -85,8 +85,8 @@ harden.sh apply  --unit <name> --profile <strict|service>
                 [--allow-write <path>]...
                 [--inaccessible <path>]...
                 --smoke "<cmd>"
-                --context-file <path>
-                [--dry-run]
+                [--context-file <path>]
+                [--execute | --dry-run]
 ```
 
 - **`--unit`** — the systemd user unit name (e.g. `llama-bonsai-qwen`).
@@ -100,9 +100,15 @@ harden.sh apply  --unit <name> --profile <strict|service>
 - **`--context-file`** — a Markdown file describing the why: the ruling,
   defect, or threat that motivated this hardening.  Stored verbatim in the
   ledger.
-- **`--dry-run`** — prints the drop-in that *would* be written, the BEFORE
-  score, the smoke command, and the rollback command.  Writes **nothing**
-  to disk and records **nothing** in the ledger.
+- **`--execute`** — perform the host change (write the drop-in, daemon-reload,
+  record the ledger). Required. Without it, `apply` dry-runs.
+- **`--dry-run`** — force the preview even when reviewing a command line.
+  Prints the drop-in that *would* be written, the BEFORE score, the smoke
+  command, and the rollback command. Writes **nothing** to disk and records
+  **nothing** in the ledger. Cannot be combined with `--execute`.
+
+Omitting both flags is a dry-run. `unlock`, `lock`, and `rollback.sh` follow
+the same rule.
 
 **Fail-closed guarantee:** If the smoke test fails after the drop-in is
 applied and `daemon-reload` is run, the toolchain:
@@ -133,7 +139,8 @@ Temporarily relaxes all sandbox directives by writing
 `~/.config/systemd/user/<unit>.d/99-unlocked.conf` that overrides each
 sandbox directive to `no`/`off`/empty.  Logs an `unlock` event in the
 ledger.  The original `90-hardening.conf` drop-in is **not** removed — it
-stays in place for `lock` to re-enable.
+stays in place for `lock` to re-enable.  Refuses the write unless
+`--execute` is passed.
 
 ### `harden.sh lock`
 
@@ -142,7 +149,7 @@ harden.sh lock --unit <name>
 ```
 
 Removes the `99-unlocked.conf` marker, re-enabling the hardening.  Logs a
-`lock` event.
+`lock` event.  Refuses the removal unless `--execute` is passed.
 
 ### `harden.sh list`
 
@@ -151,13 +158,13 @@ Lists all hardened records from the ledger.
 ### `rollback.sh --unit <name>`
 
 ```
-rollback.sh --unit <name>
+rollback.sh --unit <name> [--execute | --dry-run]
 ```
 
 Reverses the most recent `apply` for the target.  Uses the `backup_path`
 stored in the ledger to restore the prior drop-in state (or deletes the
 drop-in if there was no prior one).  Runs `daemon-reload`.  Logs a `rollback`
-event.
+event.  Dry-run unless `--execute` is passed.
 
 ## Ledger Schema
 
@@ -167,7 +174,7 @@ event.
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | TEXT PK | Slug: `<unit>-<YYYYMMDD-HHMMSS>` |
+| `id` | TEXT PK | Slug: `<unit>-<YYYYMMDD-HHMMSS>`, with `-<n>` if that second already has a row |
 | `kind` | TEXT | `'systemd-user-unit'` |
 | `target` | TEXT | The unit name |
 | `unit_file` | TEXT | Absolute path of the unit file |
@@ -205,10 +212,14 @@ event.
 ledger.py list                      # table of all hardened records
 ledger.py show <target>            # full record for a unit
 ledger.py context <target>         # the context_md for a unit
+ledger.py event <target> <action> [detail] [actor]
+ledger.py get-json <target>        # backup_path and dropin_file as JSON
+ledger.py record-json <file>       # insert the payload harden.sh writes
 ```
 
 The programmatic API (`record()`, `get()`, `list_all()`, `event()`) is
-importable and used internally by `harden.sh`.
+importable. The shell tools pass unit names as arguments to `event`,
+`get-json`, and `record-json`.
 
 ## Usage Example
 
@@ -225,22 +236,23 @@ bash harden.sh apply \
   --context-file ./context/llama-bonsai-qwen.md \
   --dry-run
 
-# Real apply (only after dry-run looks correct):
+# Real apply. Without --execute the same command only prints a dry-run:
 bash harden.sh apply \
   --unit llama-bonsai-qwen \
   --profile strict \
   --allow-write /home/leviathan/models \
   --smoke 'systemctl --user is-active llama-bonsai-qwen' \
-  --context-file ./context/llama-bonsai-qwen.md
+  --context-file ./context/llama-bonsai-qwen.md \
+  --execute
 
 # Unlock temporarily (debug):
-bash harden.sh unlock --unit llama-bonsai-qwen
+bash harden.sh unlock --unit llama-bonsai-qwen --execute
 
 # Re-lock:
-bash harden.sh lock --unit llama-bonsai-qwen
+bash harden.sh lock --unit llama-bonsai-qwen --execute
 
 # Full rollback:
-bash rollback.sh --unit llama-bonsai-qwen
+bash rollback.sh --unit llama-bonsai-qwen --execute
 ```
 
 ## Safety Rules
@@ -249,8 +261,14 @@ bash rollback.sh --unit llama-bonsai-qwen
    lives in `~/.config/systemd/user/<unit>.d/90-hardening.conf`.
 2. **FAIL CLOSED** — Smoke test failure after apply triggers automatic
    rollback + daemon-reload.
-3. **DRY-RUN FIRST** — Always inspect `--dry-run` output before applying.
+3. **DRY-RUN BY DEFAULT** — `apply`, `unlock`, `lock`, and `rollback.sh` do
+   not change the host unless `--execute` is passed. `--dry-run` forces that
+   preview. The two flags cannot be combined.
 4. **NO SERVICE RESTARTS** — `harden.sh` does not restart services; it only
    writes drop-ins and runs `daemon-reload`.
 5. **WRITE ONLY** under `hardening/` — no files are written elsewhere on disk
    (except the drop-in and backups, which are part of the systemd mechanism).
+   A dry-run writes nothing, including the backups directory.
+6. **CI STAYS OFF THE HOST** — GitHub Actions runs shellcheck, bats, and pytest
+   inside an `ubuntu:24.04` container. Tests mock `systemctl` and use a
+   temporary `HOME`. Do not point these scripts at a real machine from CI.

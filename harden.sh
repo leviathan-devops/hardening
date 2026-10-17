@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 # harden.sh — production runtime hardening toolchain for systemd user units.
 #
-# FROZEN INTERFACE:
 #   harden.sh apply  --unit <name> --profile <strict|service> [--allow-write <path>]... \
-#                    [--inaccessible <path>]... --smoke "<cmd>" --context-file <path> \
-#                    [--dry-run]
+#                    [--inaccessible <path>]... --smoke "<cmd>" [--context-file <path>] \
+#                    [--execute | --dry-run]
 #   harden.sh show   --unit <name>
-#   harden.sh unlock --unit <name>
-#   harden.sh lock   --unit <name>
+#   harden.sh unlock --unit <name> [--execute | --dry-run]
+#   harden.sh lock   --unit <name> [--execute | --dry-run]
 #   harden.sh list
 #
-# WRITE ONLY under the hardening/ directory.
-# FAIL-CLOSED: if the smoke test fails after applying, the backup drop-in is
-# restored, daemon-reload is re-run, and the failure is reported — the service
-# is never left broken.
+# apply, unlock, and lock dry-run unless --execute is given. Dry-run writes
+# nothing: no drop-in, no backup, no daemon-reload, no ledger row.
+# FAIL-CLOSED: a failed reload, smoke command, or ledger write restores the
+# previous drop-in. The service is never left broken.
 set -euo pipefail
 
 HARDENING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,22 +21,31 @@ BACKUPS_DIR="${HARDENING_DIR}/backups"
 LEDGER_PY="${HARDENING_DIR}/ledger.py"
 DROPIN_BASE="${HOME}/.config/systemd/user"
 
-mkdir -p "${BACKUPS_DIR}"
+usage() {
+  cat <<'EOF'
+usage: harden.sh apply  --unit <name> --profile <strict|service> --smoke "<cmd>" [--context-file <path>] [--allow-write <path>]... [--inaccessible <path>]... [--execute | --dry-run]
+              show   --unit <name>
+              unlock --unit <name> [--execute | --dry-run]
+              lock   --unit <name> [--execute | --dry-run]
+              list
 
-# ── helpers ────────────────────────────────────────────────────────────────
+Host changes dry-run unless --execute is given. --dry-run and --execute cannot be combined.
+EOF
+}
 
-hostname() { python3 -c 'import socket;print(socket.gethostname())'; }
+script_host() { python3 -c 'import socket; print(socket.gethostname())'; }
 
 # Run a command; returns empty on failure (best-effort).
 probe() {
   "$@" 2>/dev/null || true
 }
 
-# systemctl --user show <unit>  →  emit resolved props as JSON
+# systemctl --user show <unit> → resolved props as JSON. Empty object if systemd is absent.
 props_json() {
   local unit="$1"
-  systemctl --user show "$unit" 2>/dev/null \
-    | python3 -c '
+  local raw
+  raw="$(systemctl --user show "$unit" 2>/dev/null || true)"
+  printf '%s\n' "$raw" | python3 -c '
 import sys, json
 out = {}
 for line in sys.stdin:
@@ -50,11 +58,35 @@ print(json.dumps(out, indent=2, sort_keys=True))
 '
 }
 
-# Capture the systemd-analyze security score summary line
+# Capture the systemd-analyze security score summary line. Empty if the tool is absent.
 security_score() {
   local unit="$1"
-  systemd-analyze security --user "$unit" 2>/dev/null \
-    | grep -E 'Overall exposure level' || true
+  local raw
+  raw="$(systemd-analyze security --user "$unit" 2>/dev/null || true)"
+  printf '%s\n' "$raw" | grep -E 'Overall exposure level' || true
+}
+
+require_value() {
+  local flag="$1"
+  if [[ $# -lt 2 || -z "${2:-}" ]]; then
+    echo "FATAL: ${flag} requires a value" >&2
+    exit 2
+  fi
+}
+
+refuse_conflicting_flags() {
+  if [[ "$DRY_RUN" -eq 1 && "$EXECUTE" -eq 1 ]]; then
+    echo "FATAL: --dry-run and --execute cannot be combined" >&2
+    exit 2
+  fi
+}
+
+host_changes_allowed() {
+  [[ "$EXECUTE" -eq 1 && "$DRY_RUN" -eq 0 ]]
+}
+
+say_dry_run() {
+  echo "=== DRY RUN — refusing host changes without --execute ==="
 }
 
 # Build the drop-in content for a given profile + flags.
@@ -66,7 +98,6 @@ build_dropin() {
     exit 2
   fi
 
-  # Read the profile, filtering out comments/blank lines
   local body
   body="$(grep -v '^[[:space:]]*#' "$profile_file" | grep -v '^[[:space:]]*$' || true)"
 
@@ -77,6 +108,7 @@ build_dropin() {
   # matches the precedent unit's house style: the unit still starts even
   # if a path is absent)
   if [[ "${#INACCESSIBLE_PATHS[@]}" -gt 0 ]]; then
+    local p
     for p in "${INACCESSIBLE_PATHS[@]}"; do
       inaccessible+="${inaccessible:+$'\n'}InaccessiblePaths=-${p}"
     done
@@ -85,15 +117,18 @@ build_dropin() {
   # --allow-write paths → ReadWritePaths= (REQUIRED under ProtectSystem=strict)
   # Plus sensible defaults: WorkingDirectory + /run (systemd runtime data)
   local wd
-  wd="$(probe systemctl --user show -p WorkingDirectory "$UNIT" 2>/dev/null || true)"
+  wd="$(probe systemctl --user show -p WorkingDirectory "$UNIT" || true)"
   wd="${wd#WorkingDirectory=}"
   wd="${wd:-${HOME}}"
 
   readwrite="${wd}"
   readwrite+=$'\n/run'
-  for p in "${ALLOW_WRITE_PATHS[@]:-}"; do
-    [[ -n "$p" ]] && readwrite+=$'\n'"${p}"
-  done
+  if [[ "${#ALLOW_WRITE_PATHS[@]}" -gt 0 ]]; then
+    local allow
+    for allow in "${ALLOW_WRITE_PATHS[@]}"; do
+      [[ -n "$allow" ]] && readwrite+=$'\n'"${allow}"
+    done
+  fi
 
   local result="$body"
   if [[ -n "$inaccessible" ]]; then
@@ -101,6 +136,7 @@ build_dropin() {
   fi
   if [[ -n "$readwrite" ]]; then
     result+=$'\n# ReadWritePaths (defaults under ProtectSystem=strict)'
+    local r
     while IFS= read -r r; do
       [[ -n "$r" ]] && result+=$'\n'"ReadWritePaths=${r}"
     done <<< "$readwrite"
@@ -109,210 +145,251 @@ build_dropin() {
   printf '%s\n' "$result"
 }
 
+restore_dropin() {
+  if [[ -n "${BACKUP_PATH:-}" && -f "$BACKUP_PATH" ]]; then
+    cp "$BACKUP_PATH" "$DROPIN_FILE"
+  else
+    rm -f "$DROPIN_FILE"
+  fi
+}
+
+fail_closed() {
+  local reason="$1"
+  restore_dropin
+  systemctl --user daemon-reload || true
+  echo "========================================"
+  echo "HARDENING FAILED — FAIL CLOSED"
+  echo "========================================"
+  echo "unit          : ${UNIT}"
+  echo "profile       : ${PROFILE}"
+  echo "reason        : ${reason}"
+  if [[ -n "${SMOKE_RESULT:-}" ]]; then
+    echo "smoke result  : ${SMOKE_RESULT}"
+  fi
+  echo "rollback cmd  : ${ROLLBACK_CMD}"
+  echo "========================================"
+  exit 1
+}
+
+write_record_payload() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+(
+    target,
+    unit_file,
+    dropin_file,
+    profile,
+    profile_file,
+    before_json,
+    after_json,
+    backup_path,
+    rollback_cmd,
+    unlock_cmd,
+    lock_cmd,
+    smoke_cmd,
+    smoke_result,
+    score_before,
+    score_after,
+    context_md,
+    actor,
+    out_path,
+) = sys.argv[1:]
+profile_body = open(profile_file, encoding="utf-8").read()
+directives = {
+    "profile": profile,
+    "profile_file": profile_file,
+    "profile_body": profile_body,
+}
+data = {
+    "target": target,
+    "unit_file": unit_file,
+    "dropin_file": dropin_file,
+    "profile": profile,
+    "before_json": before_json,
+    "after_json": after_json,
+    "directives_json": json.dumps(directives),
+    "backup_path": backup_path,
+    "rollback_cmd": rollback_cmd,
+    "unlock_cmd": unlock_cmd,
+    "lock_cmd": lock_cmd,
+    "smoke_cmd": smoke_cmd,
+    "smoke_result": smoke_result,
+    "security_score_before": score_before,
+    "security_score_after": score_after,
+    "context_md": context_md,
+    "actor": actor,
+}
+with open(out_path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh)
+PY
+}
+
 # ── argument parsing ───────────────────────────────────────────────────────
 
 ACTION="${1:-}"
 shift || true
 
 UNIT=""
+UNIT_SYSTEMD=""
 PROFILE=""
 SMOKE_CMD=""
 CONTEXT_FILE=""
 DRY_RUN=0
+EXECUTE=0
 INACCESSIBLE_PATHS=()
 ALLOW_WRITE_PATHS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    apply|show|unlock|lock|list)
-      # already captured ACTION
-      ;;
     --unit)
+      require_value "$1" "${2:-}"
       UNIT="$2"
-  UNIT_SYSTEMD="${UNIT%.service}.service"; shift 2 ;;
+      shift 2
+      ;;
     --profile)
-      PROFILE="$2"; shift 2 ;;
+      require_value "$1" "${2:-}"
+      PROFILE="$2"
+      shift 2
+      ;;
     --smoke)
-      SMOKE_CMD="$2"; shift 2 ;;
+      require_value "$1" "${2:-}"
+      SMOKE_CMD="$2"
+      shift 2
+      ;;
     --context-file)
-      CONTEXT_FILE="$2"; shift 2 ;;
+      require_value "$1" "${2:-}"
+      CONTEXT_FILE="$2"
+      shift 2
+      ;;
     --dry-run)
-      DRY_RUN=1; shift ;;
+      DRY_RUN=1
+      shift
+      ;;
+    --execute)
+      EXECUTE=1
+      shift
+      ;;
     --allow-write)
-      ALLOW_WRITE_PATHS+=("$2"); shift 2 ;;
+      require_value "$1" "${2:-}"
+      ALLOW_WRITE_PATHS+=("$2")
+      shift 2
+      ;;
     --inaccessible)
-      INACCESSIBLE_PATHS+=("$2"); shift 2 ;;
+      require_value "$1" "${2:-}"
+      INACCESSIBLE_PATHS+=("$2")
+      shift 2
+      ;;
     -h|--help)
-      head -30 "$0" | tail -28
-      exit 0 ;;
+      usage
+      exit 0
+      ;;
     *)
       echo "Unknown option: $1" >&2
-      exit 2 ;;
+      exit 2
+      ;;
   esac
 done
+
+if [[ -n "$UNIT" ]]; then
+  UNIT_SYSTEMD="${UNIT%.service}.service"
+fi
 
 # ── commands ───────────────────────────────────────────────────────────────
 
 case "$ACTION" in
 
-# ════════════════════════════════════════════════════════════════════════════
-# APPLY
-# ════════════════════════════════════════════════════════════════════════════
 apply)
-  [[ -z "$UNIT" ]]     && { echo "FATAL: --unit required" >&2; exit 2; }
-  [[ -z "$PROFILE" ]]  && { echo "FATAL: --profile required" >&2; exit 2; }
+  [[ -z "$UNIT" ]] && { echo "FATAL: --unit required" >&2; exit 2; }
+  [[ -z "$PROFILE" ]] && { echo "FATAL: --profile required" >&2; exit 2; }
   [[ -z "$SMOKE_CMD" ]] && { echo "FATAL: --smoke required" >&2; exit 2; }
+  refuse_conflicting_flags
 
   PROFILE_FILE="${PROFILES_DIR}/${PROFILE}.conf"
   [[ ! -f "$PROFILE_FILE" ]] && { echo "FATAL: profile '${PROFILE}' not found" >&2; exit 2; }
 
-  # Resolve unit file path
-  UNIT_FILE="$(probe systemctl --user show -p FragmentPath "$UNIT")"
+  UNIT_FILE="$(probe systemctl --user show -p FragmentPath "$UNIT" || true)"
   UNIT_FILE="${UNIT_FILE#FragmentPath=}"
-  [[ -z "$UNIT_FILE" ]] && UNIT_FILE=""
 
-  # Capture BEFORE state
   BEFORE_JSON="$(props_json "$UNIT")"
   SCORE_BEFORE="$(security_score "$UNIT")"
-
-  # Build directives object (what we are applying)
-  DIRECTIVES_JSON="$(python3 -c "
-import json
-profile_body = open('${PROFILE_FILE}').read()
-print(json.dumps({'profile': '${PROFILE}', 'profile_file': '${PROFILE_FILE}', 'profile_body': profile_body}))
-")"
-
-  # Build the drop-in content
   DROPIN_CONTENT="$(printf '[Service]\n%s' "$(build_dropin "$PROFILE")")"
 
-  # Determine the drop-in file path
   DROPIN_DIR="${DROPIN_BASE}/${UNIT_SYSTEMD}.d"
   DROPIN_FILE="${DROPIN_DIR}/90-hardening.conf"
-
-  # Backup any existing drop-in
   BACKUP_PATH=""
-  if [[ -f "$DROPIN_FILE" ]]; then
-    BACKUP_PATH="${BACKUPS_DIR}/${UNIT}-$(date +%Y%m%d-%H%M%S).conf"
-    cp "$DROPIN_FILE" "$BACKUP_PATH"
-  fi
 
-  # Read context file
   CONTEXT_MD=""
   if [[ -n "$CONTEXT_FILE" && -f "$CONTEXT_FILE" ]]; then
     CONTEXT_MD="$(cat "$CONTEXT_FILE")"
   fi
 
-  ROLLBACK_CMD="bash ${HARDENING_DIR}/rollback.sh --unit ${UNIT}"
-  UNLOCK_CMD="bash ${HARDENING_DIR}/harden.sh unlock --unit ${UNIT}"
-  LOCK_CMD="bash ${HARDENING_DIR}/harden.sh lock --unit ${UNIT}"
+  unit_q="$(printf '%q' "$UNIT")"
+  ROLLBACK_CMD="bash ${HARDENING_DIR}/rollback.sh --unit ${unit_q} --execute"
+  UNLOCK_CMD="bash ${HARDENING_DIR}/harden.sh unlock --unit ${unit_q} --execute"
+  LOCK_CMD="bash ${HARDENING_DIR}/harden.sh lock --unit ${unit_q} --execute"
 
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "=== DRY RUN — no changes written, no ledger record ==="
+  if ! host_changes_allowed; then
+    say_dry_run
     echo "--- drop-in that WOULD be written: ${DROPIN_FILE} ---"
-    echo ""
-    echo "  [Service]"
-    echo "$DROPIN_CONTENT"
-    echo ""
+    printf '%s\n' "$DROPIN_CONTENT"
     echo "--- BEFORE score: ${SCORE_BEFORE:-<no score>} ---"
     echo "--- smoke command: ${SMOKE_CMD} ---"
     echo "--- rollback command: ${ROLLBACK_CMD} ---"
-    if [[ -n "$BACKUP_PATH" ]]; then
-      echo "--- would back up existing drop-in to: ${BACKUP_PATH} ---"
+    if [[ -f "$DROPIN_FILE" ]]; then
+      echo "--- would back up existing drop-in under: ${BACKUPS_DIR} ---"
     fi
-    echo "=== DRY RUN complete — ledger NOT modified ==="
+    echo "=== DRY RUN complete — nothing written, ledger NOT modified ==="
     exit 0
   fi
 
-  # ── REAL APPLY ───────────────────────────────────────────────────────────
+  if [[ -f "$DROPIN_FILE" ]]; then
+    mkdir -p "$BACKUPS_DIR"
+    BACKUP_PATH="${BACKUPS_DIR}/${UNIT}-$(date +%Y%m%d-%H%M%S).conf"
+    cp "$DROPIN_FILE" "$BACKUP_PATH"
+  fi
 
-  # Write the drop-in
   mkdir -p "$DROPIN_DIR"
-  printf '%s\n' "$DROPIN_CONTENT" > "$DROPIN_FILE"
+  printf '%s\n' "$DROPIN_CONTENT" >"$DROPIN_FILE"
 
-  # daemon-reload
-  systemctl --user daemon-reload
+  if ! systemctl --user daemon-reload; then
+    fail_closed "daemon-reload failed"
+  fi
 
-  # Capture AFTER state
-  AFTER_JSON="$(props_json "$UNIT")"
-  SCORE_AFTER="$(security_score "$UNIT")"
-
-  # Run the smoke test
   SMOKE_OUTPUT=""
   SMOKE_EXIT=0
   set +e
+  # Operator-supplied check. It is stored as a command string and re-run as given.
   SMOKE_OUTPUT="$(eval "$SMOKE_CMD" 2>&1)"
   SMOKE_EXIT=$?
   set -e
-
   if [[ $SMOKE_EXIT -ne 0 ]]; then
     SMOKE_RESULT="FAILED (exit ${SMOKE_EXIT})
 ${SMOKE_OUTPUT}"
-    # FAIL-CLOSED: restore backup, daemon-reload, report
-    if [[ -n "$BACKUP_PATH" && -f "$BACKUP_PATH" ]]; then
-      cp "$BACKUP_PATH" "$DROPIN_FILE"
-    else
-      rm -f "$DROPIN_FILE"
-    fi
-    systemctl --user daemon-reload
-    SCORE_AFTER_FAIL="$(security_score "$UNIT")"
-
-    echo "========================================"
-    echo "HARDENING FAILED — FAIL CLOSED"
-    echo "========================================"
-    echo "unit          : ${UNIT}"
-    echo "profile       : ${PROFILE}"
-    echo "before score  : ${SCORE_BEFORE:-<none>}"
-    echo "after score   : ${SCORE_AFTER_FAIL:-<none>}"
-    echo "smoke result  : ${SMOKE_RESULT}"
-    echo "rollback cmd  : ${ROLLBACK_CMD}"
-    echo "========================================"
-    exit 1
+    fail_closed "smoke command failed"
   fi
-
   SMOKE_RESULT="OK (exit ${SMOKE_EXIT})
 ${SMOKE_OUTPUT}"
 
-  # Record in ledger via a temp JSON file (avoids all shell-escaping)
-  _tmp_json=""
-  _tmp_json="$(mktemp /tmp/harden_ledger_XXXXXX.json)"
-  python3 -c "
-import json, sys
-data = {
-    'target': sys.argv[1],
-    'unit_file': sys.argv[2] if sys.argv[2] else None,
-    'dropin_file': sys.argv[3],
-    'profile': sys.argv[4],
-    'before_json': json.loads(sys.argv[5]) if sys.argv[5].strip() else None,
-    'after_json': json.loads(sys.argv[6]) if sys.argv[6].strip() else None,
-    'directives_json': json.loads(sys.argv[7]) if sys.argv[7].strip() else None,
-    'backup_path': sys.argv[8] if sys.argv[8] else None,
-    'rollback_cmd': sys.argv[9],
-    'unlock_cmd': sys.argv[10],
-    'lock_cmd': sys.argv[11],
-    'smoke_cmd': sys.argv[12],
-    'smoke_result': sys.argv[13],
-    'security_score_before': sys.argv[14],
-    'security_score_after': sys.argv[15],
-    'context_md': sys.argv[16],
-}
-with open(sys.argv[17], 'w') as f:
-    json.dump(data, f)
-" "$UNIT" "$UNIT_FILE" "$DROPIN_FILE" "$PROFILE" \
-    "$BEFORE_JSON" "$AFTER_JSON" "$DIRECTIVES_JSON" \
-    "$BACKUP_PATH" "$ROLLBACK_CMD" "$UNLOCK_CMD" "$LOCK_CMD" \
+  SCORE_AFTER="$(security_score "$UNIT")"
+  AFTER_JSON="$(props_json "$UNIT")"
+
+  tmp_json="$(mktemp)"
+  if ! write_record_payload \
+    "$UNIT" "$UNIT_FILE" "$DROPIN_FILE" "$PROFILE" "$PROFILE_FILE" \
+    "$BEFORE_JSON" "$AFTER_JSON" "$BACKUP_PATH" "$ROLLBACK_CMD" "$UNLOCK_CMD" "$LOCK_CMD" \
     "$SMOKE_CMD" "$SMOKE_RESULT" "$SCORE_BEFORE" "$SCORE_AFTER" \
-    "$CONTEXT_MD" "$_tmp_json"
+    "$CONTEXT_MD" "$(script_host)" "$tmp_json"; then
+    rm -f "$tmp_json"
+    fail_closed "ledger record failed"
+  fi
+  if ! python3 "$LEDGER_PY" record-json "$tmp_json"; then
+    rm -f "$tmp_json"
+    fail_closed "ledger record failed"
+  fi
+  rm -f "$tmp_json"
 
-  python3 -c "
-import json, sys
-sys.path.insert(0, '$HARDENING_DIR')
-import ledger as L
-d = json.load(open('${_tmp_json}'))
-L.record(**d)
-" 2>/dev/null || true
-  rm -f "$_tmp_json"
-
-  # Final report
   echo "========================================"
   echo "HARDENING APPLIED"
   echo "========================================"
@@ -327,9 +404,6 @@ L.record(**d)
   echo "========================================"
   ;;
 
-# ════════════════════════════════════════════════════════════════════════════
-# SHOW
-# ════════════════════════════════════════════════════════════════════════════
 show)
   [[ -z "$UNIT" ]] && { echo "FATAL: --unit required" >&2; exit 2; }
   DROPIN_FILE="${DROPIN_BASE}/${UNIT_SYSTEMD}.d/90-hardening.conf"
@@ -343,16 +417,18 @@ show)
   python3 "$LEDGER_PY" show "$UNIT" 2>/dev/null || echo "[no ledger record for ${UNIT}]"
   ;;
 
-# ════════════════════════════════════════════════════════════════════════════
-# UNLOCK
-# ════════════════════════════════════════════════════════════════════════════
 unlock)
   [[ -z "$UNIT" ]] && { echo "FATAL: --unit required" >&2; exit 2; }
+  refuse_conflicting_flags
   DROPIN_DIR="${DROPIN_BASE}/${UNIT_SYSTEMD}.d"
   UNLOCK_FILE="${DROPIN_DIR}/99-unlocked.conf"
+  if ! host_changes_allowed; then
+    say_dry_run
+    echo "would write ${UNLOCK_FILE} and daemon-reload"
+    exit 0
+  fi
   mkdir -p "$DROPIN_DIR"
-  # Override every sandbox directive to relaxed/off values.
-  cat > "$UNLOCK_FILE" <<'EOF'
+  cat >"$UNLOCK_FILE" <<'EOF'
 # Temporary unlock — written by harden.sh unlock
 # Overrides ALL hardening sandbox directives to relaxed/off values.
 NoNewPrivileges=no
@@ -374,42 +450,66 @@ SystemCallArchitectures=
 InaccessiblePaths=
 ReadWritePaths=
 EOF
-  systemctl --user daemon-reload
-  python3 "$LEDGER_PY" event "$UNIT" "unlock" "temporary sandbox relaxation via ${UNLOCK_FILE}" "$(hostname)"
+  if ! systemctl --user daemon-reload; then
+    rm -f "$UNLOCK_FILE"
+    echo "UNLOCK FAILED — FAIL CLOSED (daemon-reload)"
+    exit 1
+  fi
+  if ! python3 "$LEDGER_PY" event "$UNIT" "unlock" "temporary sandbox relaxation via ${UNLOCK_FILE}" "$(script_host)"; then
+    rm -f "$UNLOCK_FILE"
+    systemctl --user daemon-reload || true
+    echo "UNLOCK FAILED — FAIL CLOSED (ledger)"
+    exit 1
+  fi
   echo "UNLOCKED: ${UNLOCK_FILE} written, daemon-reload done."
-  echo "Re-lock with: bash ${HARDENING_DIR}/harden.sh lock --unit ${UNIT}"
+  echo "Re-lock with: bash ${HARDENING_DIR}/harden.sh lock --unit $(printf '%q' "$UNIT") --execute"
   ;;
 
-# ════════════════════════════════════════════════════════════════════════════
-# LOCK
-# ════════════════════════════════════════════════════════════════════════════
 lock)
   [[ -z "$UNIT" ]] && { echo "FATAL: --unit required" >&2; exit 2; }
+  refuse_conflicting_flags
   UNLOCK_FILE="${DROPIN_BASE}/${UNIT_SYSTEMD}.d/99-unlocked.conf"
-  if [[ -f "$UNLOCK_FILE" ]]; then
-    rm -f "$UNLOCK_FILE"
-    systemctl --user daemon-reload
-    python3 "$LEDGER_PY" event "$UNIT" "lock" "unlock marker removed, hardening re-applied" "$(hostname)"
-    echo "LOCKED: ${UNLOCK_FILE} removed, daemon-reload done."
-  else
-    echo "[no unlock marker found at ${UNLOCK_FILE}]"
+  if ! host_changes_allowed; then
+    say_dry_run
+    if [[ -f "$UNLOCK_FILE" ]]; then
+      echo "would remove ${UNLOCK_FILE} and daemon-reload"
+    else
+      echo "[no unlock marker found at ${UNLOCK_FILE}]"
+    fi
+    exit 0
   fi
+  if [[ ! -f "$UNLOCK_FILE" ]]; then
+    echo "[no unlock marker found at ${UNLOCK_FILE}]"
+    exit 0
+  fi
+  snapshot="$(mktemp)"
+  cp "$UNLOCK_FILE" "$snapshot"
+  rm -f "$UNLOCK_FILE"
+  if ! systemctl --user daemon-reload; then
+    mkdir -p "$(dirname "$UNLOCK_FILE")"
+    cp "$snapshot" "$UNLOCK_FILE"
+    rm -f "$snapshot"
+    echo "LOCK FAILED — FAIL CLOSED (daemon-reload)"
+    exit 1
+  fi
+  if ! python3 "$LEDGER_PY" event "$UNIT" "lock" "unlock marker removed, hardening re-applied" "$(script_host)"; then
+    mkdir -p "$(dirname "$UNLOCK_FILE")"
+    cp "$snapshot" "$UNLOCK_FILE"
+    rm -f "$snapshot"
+    systemctl --user daemon-reload || true
+    echo "LOCK FAILED — FAIL CLOSED (ledger)"
+    exit 1
+  fi
+  rm -f "$snapshot"
+  echo "LOCKED: ${UNLOCK_FILE} removed, daemon-reload done."
   ;;
 
-# ════════════════════════════════════════════════════════════════════════════
-# LIST
-# ════════════════════════════════════════════════════════════════════════════
 list)
   python3 "$LEDGER_PY" list
   ;;
 
-# ════════════════════════════════════════════════════════════════════════════
 *)
-  echo "usage: harden.sh apply  --unit <name> --profile <strict|service> ..." >&2
-  echo "              show   --unit <name>" >&2
-  echo "              unlock --unit <name>" >&2
-  echo "              lock   --unit <name>" >&2
-  echo "              list" >&2
+  usage >&2
   exit 2
   ;;
 esac
